@@ -2,7 +2,7 @@
 
 - **Author:** Apeksha Adekar
 - **Date:** 2026-10-03
-- **Status:** Draft — awaiting review
+- **Status:** Draft rev 2 — switched datastore to MySQL 8 (was Postgres)
 - **Context:** Paytm Money Backend Engineering take-home, "Deploy & Observe" round
 
 ---
@@ -24,7 +24,7 @@ Correctness is graded alongside **Deploy & Observe**: the running service must b
 
 ### 1.2 Secondary goals
 
-- Clean clone → `docker compose up` → working local service with Postgres.
+- Clean clone → `docker compose up` → working local service with MySQL on port **3307** (3306 is reserved on dev machine for an unrelated DB).
 - Incremental commit history that shows the work was done in realistic steps.
 - A `WRITEUP.md` that covers the atomic mechanism, idempotency, holds, CAP posture, observability, AI usage, and next steps.
 
@@ -54,7 +54,7 @@ When ~20,000 concurrent reservation attempts are fired at a fresh show, with a s
 | C4 | Same key, same body → one reservation. Same key, different body → `409 idempotency_key_conflict`. | Dedicated scenarios in the harness. |
 | C5 | A user firing 10 parallel reserves on a `limit=4` show ends with ≤4 held. | Harness scenario + per-user tally. |
 | C6 | Spoofed `user_id` in request body is ignored; a user cannot cancel another's reservation. | Integration test. |
-| C7 | `/readyz` fails closed when DB is unreachable. | Local test: stop Postgres container, hit `/readyz`, expect `503`. |
+| C7 | `/readyz` fails closed when DB is unreachable. | Local test: stop MySQL container, hit `/readyz`, expect `503`. |
 | C8 | A clean clone + `docker compose up` yields a working service. | CI / local verification. |
 
 ---
@@ -69,7 +69,7 @@ When ~20,000 concurrent reservation attempts are fired at a fresh show, with a s
                                 │ HTTPS
                                 ▼
 ┌──────────────────────────────────────────────────┐
-│  Fly.io machine (always-on, min_machines=1)      │
+│  Fly.io machine — app (always-on, min=1)         │
 │                                                  │
 │  ┌───────────────────────────────────────────┐   │
 │  │  Fastify (Node 20, TypeScript)            │   │
@@ -85,19 +85,21 @@ When ~20,000 concurrent reservation attempts are fired at a fresh show, with a s
 │  │  │    GET  /healthz   /readyz   /metrics  │   │
 │  │  └─ Metrics (prom-client)                 │   │
 │  └──────────────────┬────────────────────────┘   │
-│                     │ pg (connection pool)        │
+│                     │ mysql2 (connection pool)    │
 └─────────────────────┼───────────────────────────┘
-                      │
+                      │ Fly internal network
                       ▼
-            ┌──────────────────────┐
-            │  Neon Postgres 16    │
-            │  (built-in pooler)   │
-            └──────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Fly.io machine — db                             │
+│   mysql:8 on persistent volume /var/lib/mysql    │
+│   bind 0.0.0.0:3306 (Fly private net only)       │
+└──────────────────────────────────────────────────┘
 ```
 
 **Topology notes:**
-- Single Fly machine for v1. Horizontal scale is possible without changing correctness because all contention is resolved in the DB.
-- Neon's built-in pgbouncer-equivalent sits between Fly and Postgres so burst spikes don't exhaust direct connections.
+- Two Fly machines in the same region/private-net: `app` and `db`. Both covered by Fly's free allowance (shared-cpu-1x × up to 3 machines + 3GB persistent volume).
+- MySQL is self-hosted on a persistent Fly volume so data survives machine restarts. No managed-MySQL free tier that meets both "always on" and "free forever" exists cleanly in 2026 — self-hosting on Fly is the simplest predictable choice.
+- Horizontal scaling of the app is possible without changing correctness because *all* contention is resolved in the DB (row locks + `GET_LOCK`).
 - No Redis, no queue, no second datastore. One source of truth.
 
 ---
@@ -234,8 +236,7 @@ Public. No auth required.
   "confirmed": 25,
   "seats": [
     { "label": "A1", "status": "confirmed" },
-    { "label": "A2", "status": "held" },
-    ...
+    { "label": "A2", "status": "held" }
   ]
 }
 ```
@@ -251,7 +252,7 @@ Liveness. Returns `200 {"status":"ok"}` whenever the process is up. Does *not* c
 
 ### 5.9 `GET /readyz`
 
-Readiness. Runs `SELECT 1` against the DB with a 500ms timeout.
+Readiness. Runs `SELECT 1` against MySQL with a 500ms timeout.
 - Success → `200 {"status":"ready"}`
 - Failure → `503 {"status":"not_ready","error":{"code":"db_unavailable"}}`
 
@@ -263,70 +264,82 @@ Prometheus text exposition. See §12.
 
 ## 6. Data model
 
-### 6.1 DDL
+### 6.1 DDL (MySQL 8)
 
 ```sql
--- Enums ------------------------------------------------------------
-CREATE TYPE seat_status AS ENUM ('available', 'held', 'confirmed');
-CREATE TYPE reservation_status AS ENUM ('held', 'confirmed', 'cancelled', 'expired');
-
 -- shows ------------------------------------------------------------
 CREATE TABLE shows (
-  id               TEXT PRIMARY KEY,                 -- 'shw_' + ULID
-  name             TEXT NOT NULL,
-  price_paise      BIGINT NOT NULL CHECK (price_paise >= 0),
-  per_user_limit   INT    NOT NULL DEFAULT 4 CHECK (per_user_limit > 0),
-  hold_ttl_seconds INT    NOT NULL DEFAULT 120 CHECK (hold_ttl_seconds > 0),
-  total_seats      INT    NOT NULL,
-  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+  id               VARCHAR(32)  NOT NULL PRIMARY KEY,         -- 'shw_' + ULID
+  name             VARCHAR(255) NOT NULL,
+  price_paise      BIGINT       NOT NULL CHECK (price_paise >= 0),
+  per_user_limit   INT          NOT NULL DEFAULT 4 CHECK (per_user_limit > 0),
+  hold_ttl_seconds INT          NOT NULL DEFAULT 120 CHECK (hold_ttl_seconds > 0),
+  total_seats      INT          NOT NULL,
+  created_at       DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB;
 
 -- seats ------------------------------------------------------------
+-- `held_or_confirmed_key` is a generated column that stores
+--   CONCAT(show_id, '|', label) when status is non-available, else NULL.
+-- A UNIQUE index on it enforces: for any (show, label) at most one row
+-- can be in state 'held' or 'confirmed' at a time.
+-- This is the MySQL equivalent of a Postgres partial unique index and
+-- serves as the physical backstop against double-sell.
 CREATE TABLE seats (
-  id              BIGSERIAL PRIMARY KEY,
-  show_id         TEXT NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
-  label           TEXT NOT NULL,
-  status          seat_status NOT NULL DEFAULT 'available',
-  held_by         TEXT,                              -- user_id
-  held_until      TIMESTAMPTZ,
-  reservation_id  TEXT,                              -- weak ref; no FK (reservation may not exist yet)
-  version         INT  NOT NULL DEFAULT 0,
-  UNIQUE (show_id, label)
-);
-CREATE INDEX seats_show_status_idx ON seats (show_id, status);
+  id              BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  show_id         VARCHAR(32)  NOT NULL,
+  label           VARCHAR(16)  NOT NULL,
+  status          ENUM('available','held','confirmed') NOT NULL DEFAULT 'available',
+  held_by         VARCHAR(64)  NULL,                           -- user_id
+  held_until      DATETIME(6)  NULL,
+  reservation_id  VARCHAR(32)  NULL,                           -- weak ref (no FK)
+  version         INT          NOT NULL DEFAULT 0,
+  held_or_confirmed_key VARCHAR(64) GENERATED ALWAYS AS (
+    CASE WHEN status IN ('held','confirmed')
+         THEN CONCAT(show_id, '|', label)
+         ELSE NULL
+    END
+  ) VIRTUAL,
+  CONSTRAINT fk_seats_show FOREIGN KEY (show_id) REFERENCES shows(id) ON DELETE CASCADE,
+  UNIQUE KEY uq_seats_show_label (show_id, label),
+  UNIQUE KEY uq_seats_held_or_confirmed (held_or_confirmed_key),
+  KEY idx_seats_show_status (show_id, status)
+) ENGINE=InnoDB;
 
 -- reservations -----------------------------------------------------
 CREATE TABLE reservations (
-  id              TEXT PRIMARY KEY,                  -- 'rsv_' + ULID
-  show_id         TEXT NOT NULL REFERENCES shows(id),
-  user_id         TEXT NOT NULL,
-  status          reservation_status NOT NULL,
-  amount_paise    BIGINT NOT NULL,
-  expires_at      TIMESTAMPTZ,                       -- NULL once confirmed/cancelled
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  confirmed_at    TIMESTAMPTZ,
-  cancelled_at    TIMESTAMPTZ
-);
-CREATE INDEX reservations_user_show_status_idx
-  ON reservations (user_id, show_id, status);
+  id              VARCHAR(32)  NOT NULL PRIMARY KEY,           -- 'rsv_' + ULID
+  show_id         VARCHAR(32)  NOT NULL,
+  user_id         VARCHAR(64)  NOT NULL,
+  status          ENUM('held','confirmed','cancelled','expired') NOT NULL,
+  amount_paise    BIGINT       NOT NULL,
+  expires_at      DATETIME(6)  NULL,                           -- NULL once confirmed/cancelled
+  created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  confirmed_at    DATETIME(6)  NULL,
+  cancelled_at    DATETIME(6)  NULL,
+  CONSTRAINT fk_reservations_show FOREIGN KEY (show_id) REFERENCES shows(id),
+  KEY idx_reservations_user_show_status (user_id, show_id, status)
+) ENGINE=InnoDB;
 
 -- reservation_seats (join) ----------------------------------------
 CREATE TABLE reservation_seats (
-  reservation_id  TEXT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
-  seat_id         BIGINT NOT NULL REFERENCES seats(id),
-  PRIMARY KEY (reservation_id, seat_id)
-);
-CREATE INDEX reservation_seats_seat_idx ON reservation_seats (seat_id);
+  reservation_id  VARCHAR(32) NOT NULL,
+  seat_id         BIGINT      NOT NULL,
+  PRIMARY KEY (reservation_id, seat_id),
+  CONSTRAINT fk_rs_reservation FOREIGN KEY (reservation_id) REFERENCES reservations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rs_seat        FOREIGN KEY (seat_id)        REFERENCES seats(id),
+  KEY idx_rs_seat (seat_id)
+) ENGINE=InnoDB;
 
 -- idempotency_keys ------------------------------------------------
 CREATE TABLE idempotency_keys (
-  user_id         TEXT NOT NULL,
-  key             TEXT NOT NULL,
-  request_hash    TEXT NOT NULL,                     -- sha256 hex of (show_id || sorted(seats))
-  reservation_id  TEXT,                              -- NULL only transiently
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (user_id, key)
-);
+  user_id         VARCHAR(64)  NOT NULL,
+  idem_key        VARCHAR(128) NOT NULL,                       -- `key` is a MySQL reserved word
+  request_hash    CHAR(64)     NOT NULL,                       -- sha256 hex
+  reservation_id  VARCHAR(32)  NULL,                           -- NULL only transiently
+  created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (user_id, idem_key)
+) ENGINE=InnoDB;
 ```
 
 ### 6.2 Why these shapes
@@ -334,139 +347,159 @@ CREATE TABLE idempotency_keys (
 - **`seats` as the mutable row of truth.** The atomic decision is a conditional UPDATE on this row. No derived state, no shadow table.
 - **No FK from `seats.reservation_id` to `reservations.id`.** During a reserve transaction we set `seats.reservation_id` before the reservation row is inserted. We accept a weak reference to keep the critical section simple.
 - **`version` column.** Monotonically bumped on each state change — useful for structured logs and future optimistic-concurrency extensions, cheap to maintain.
-- **`idempotency_keys` is `(user_id, key)` composite PK.** Prevents cross-user key collisions and makes the atomic insert trivial.
+- **Generated column + UNIQUE as the double-sell backstop.** MySQL has no partial indexes, so we use `held_or_confirmed_key` (NULL when status='available', otherwise `show_id|label`). MySQL does not include NULL values in UNIQUE enforcement — so many `available` seats are fine, but at most one `held`/`confirmed` row can share a `(show, label)` key. This is a physical guarantee independent of application logic.
+- **`idempotency_keys` is `(user_id, idem_key)` composite PK.** Prevents cross-user key collisions. Column renamed from `key` since `key` is reserved in MySQL.
 - **`total_seats` cached on `shows`.** The reconciliation invariant checks against this; computing it from `seats` is possible but round-trippy under burst.
+- **InnoDB everywhere.** Row-level locking, deadlock detection, transactional DDL — all required.
 
 ---
 
 ## 7. The atomic reserve algorithm (the critical section)
 
+**Important MySQL-specific note:** `GET_LOCK` is **session-scoped**, not transaction-scoped. It must be released explicitly inside a `finally` block *before* the connection is returned to the pool. If the connection drops (socket close), MySQL releases automatically — but we never rely on that.
+
 ```
 reserve(show_id, user_id, seats[], idempotency_key, request_hash):
-  with db.transaction(isolation=READ_COMMITTED) as tx:
 
-    # 0. Serialize per-(user, show) attempts.
+  with pool.acquire() as conn:                        # dedicated conn for the whole op
+    conn.query("SET SESSION transaction_isolation = 'READ-COMMITTED'")
+    lock_name = f"rsv:{user_id}:{show_id}"
+
+    # 0. Serialize per-(user, show) attempts via a MySQL named lock.
     # Required: without this, two parallel reserves from the same user on
     # DISJOINT seats both pass the per-user limit pre-count and both commit,
-    # pushing the user over the limit. Advisory lock serializes cheaply
-    # (in-memory on the DB side; auto-released at commit/rollback).
-    tx.execute("""
-      SELECT pg_advisory_xact_lock(
-        hashtext($1 || ':' || $2)::bigint
+    # pushing the user over the limit (writes don't overlap so InnoDB can't
+    # catch it). Named lock is a cheap, in-memory mutex keyed by (user,show).
+    got = conn.query_scalar("SELECT GET_LOCK(?, 5)", lock_name)
+    if got != 1:
+      raise Conflict('in_flight')                     # 5s wait timeout — treat as retryable
+
+    try:
+      conn.query("START TRANSACTION")
+
+      # 1. Idempotency guard — INSERT IGNORE + check affectedRows
+      conn.execute(
+        "INSERT IGNORE INTO idempotency_keys (user_id, idem_key, request_hash) "
+        "VALUES (?, ?, ?)",
+        user_id, idempotency_key, request_hash
       )
-    """, user_id, show_id)
 
-    # 1. Idempotency guard
-    inserted = tx.execute("""
-      INSERT INTO idempotency_keys (user_id, key, request_hash)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id, key) DO NOTHING
-      RETURNING key
-    """, user_id, idempotency_key, request_hash)
+      if conn.affected_rows() == 0:
+        # Row already existed — this is a replay path.
+        row = conn.query_one(
+          "SELECT request_hash, reservation_id FROM idempotency_keys "
+          " WHERE user_id=? AND idem_key=?",
+          user_id, idempotency_key
+        )
+        if row.request_hash != request_hash:
+          conn.query("ROLLBACK")
+          raise Conflict('idempotency_key_conflict')
+        if row.reservation_id is None:
+          conn.query("ROLLBACK")
+          raise Conflict('in_flight')
+        result = load_reservation(conn, row.reservation_id)
+        conn.query("COMMIT")
+        return result
 
-    if not inserted:
-      row = tx.query_one("""
-        SELECT request_hash, reservation_id
-          FROM idempotency_keys
-         WHERE user_id=$1 AND key=$2
-      """, user_id, idempotency_key)
-      if row.request_hash != request_hash:
-        raise Conflict('idempotency_key_conflict')
-      if row.reservation_id is None:
-        raise Conflict('in_flight')
-      return load_reservation(tx, row.reservation_id)
+      # 2. Lazy sweep of expired holds on just these seats
+      conn.execute(
+        f"UPDATE seats "
+        f"   SET status='available', held_by=NULL, held_until=NULL, "
+        f"       reservation_id=NULL, version=version+1 "
+        f" WHERE show_id=? AND label IN ({placeholders(seats)}) "
+        f"   AND status='held' AND held_until < NOW(6)",
+        show_id, *seats
+      )
 
-    # 2. Lazy sweep of expired holds on just these seats
-    tx.execute("""
-      UPDATE seats
-         SET status='available', held_by=NULL, held_until=NULL, reservation_id=NULL,
-             version=version+1
-       WHERE show_id=$1 AND label = ANY($2)
-         AND status='held' AND held_until < now()
-    """, show_id, seats)
+      # 3. Per-user limit (count current held+confirmed on this show)
+      current = conn.query_scalar(
+        "SELECT COUNT(*) "
+        "  FROM reservation_seats rs "
+        "  JOIN reservations r ON r.id = rs.reservation_id "
+        " WHERE r.show_id=? AND r.user_id=? "
+        "   AND r.status IN ('held','confirmed')",
+        show_id, user_id
+      )
+      if current + len(seats) > show.per_user_limit:
+        conn.query("ROLLBACK")
+        raise Conflict('per_user_limit_exceeded')
 
-    # 3. Per-user limit (count current held+confirmed on this show)
-    current = tx.query_scalar("""
-      SELECT count(*)
-        FROM reservation_seats rs
-        JOIN reservations r ON r.id = rs.reservation_id
-       WHERE r.show_id=$1 AND r.user_id=$2
-         AND r.status IN ('held','confirmed')
-    """, show_id, user_id)
+      # 4. Lock target seat rows in deterministic order (sorted by label).
+      # Sorting prevents cycle-wait deadlocks between concurrent multi-seat
+      # requests on overlapping sets (e.g. [A12,A13] vs [A13,A12]).
+      locked = conn.query_all(
+        f"SELECT id, label, status "
+        f"  FROM seats "
+        f" WHERE show_id=? AND label IN ({placeholders(seats)}) "
+        f" ORDER BY label "
+        f"   FOR UPDATE",
+        show_id, *seats
+      )
 
-    if current + len(seats) > show.per_user_limit:
-      raise Conflict('per_user_limit_exceeded')
+      if len(locked) != len(seats):
+        conn.query("ROLLBACK")
+        raise BadRequest('invalid_seats')             # some labels don't belong to this show
 
-    # 4. Lock target seat rows in deterministic order
-    locked = tx.query_all("""
-      SELECT id, label, status
-        FROM seats
-       WHERE show_id=$1 AND label = ANY($2)
-       ORDER BY label                     -- deterministic — deadlock-free
-         FOR UPDATE
-    """, show_id, seats)
+      for s in locked:
+        if s.status != 'available':
+          conn.query("ROLLBACK")
+          raise Conflict('seat_taken')
 
-    if len(locked) != len(seats):
-      raise BadRequest('invalid_seats')   # some labels don't belong to this show
+      # 5. Create reservation row (status=held)
+      reservation_id = 'rsv_' + ulid()
+      expires_at = now() + show.hold_ttl_seconds
+      amount = show.price_paise * len(seats)
 
-    for s in locked:
-      if s.status != 'available':
-        raise Conflict('seat_taken')
+      conn.execute(
+        "INSERT INTO reservations (id, show_id, user_id, status, amount_paise, expires_at) "
+        "VALUES (?, ?, ?, 'held', ?, ?)",
+        reservation_id, show_id, user_id, amount, expires_at
+      )
 
-    # 5. Create reservation row (status=held)
-    reservation_id = 'rsv_' + ulid()
-    expires_at = now() + show.hold_ttl_seconds
-    amount = show.price_paise * len(seats)
+      # 6. Conditional UPDATE each locked seat — belt-and-suspenders.
+      # The generated-column UNIQUE on held_or_confirmed_key would also
+      # fire (duplicate-key error) if two tx attempted to flip the same
+      # seat concurrently — but the FOR UPDATE above already prevents it.
+      for s in locked:
+        conn.execute(
+          "UPDATE seats "
+          "   SET status='held', held_by=?, held_until=?, "
+          "       reservation_id=?, version=version+1 "
+          " WHERE id=? AND status='available'",
+          user_id, expires_at, reservation_id, s.id
+        )
+        if conn.affected_rows() != 1:
+          conn.query("ROLLBACK")
+          raise Conflict('seat_taken')                # impossible given FOR UPDATE; defends against bugs
 
-    tx.execute("""
-      INSERT INTO reservations (id, show_id, user_id, status, amount_paise, expires_at)
-      VALUES ($1, $2, $3, 'held', $4, $5)
-    """, reservation_id, show_id, user_id, amount, expires_at)
+        conn.execute(
+          "INSERT INTO reservation_seats (reservation_id, seat_id) VALUES (?, ?)",
+          reservation_id, s.id
+        )
 
-    # 6. Conditional UPDATE each locked seat — belt-and-suspenders
-    for s in locked:
-      updated = tx.execute("""
-        UPDATE seats
-           SET status='held', held_by=$1, held_until=$2,
-               reservation_id=$3, version=version+1
-         WHERE id=$4 AND status='available'
-      """, user_id, expires_at, reservation_id, s.id)
-      if updated.rowcount != 1:
-        # Impossible given the FOR UPDATE above, but defends against bugs.
-        raise Conflict('seat_taken')
+      # 7. Close the idempotency loop
+      conn.execute(
+        "UPDATE idempotency_keys SET reservation_id=? "
+        " WHERE user_id=? AND idem_key=?",
+        reservation_id, user_id, idempotency_key
+      )
 
-      tx.execute("""
-        INSERT INTO reservation_seats (reservation_id, seat_id)
-        VALUES ($1, $2)
-      """, reservation_id, s.id)
+      conn.query("COMMIT")
+      return reservation(id=reservation_id, status='held', ...)
 
-    # 7. Close the idempotency loop
-    tx.execute("""
-      UPDATE idempotency_keys SET reservation_id=$1
-       WHERE user_id=$2 AND key=$3
-    """, reservation_id, user_id, idempotency_key)
-
-    # commit
-  return reservation(id=reservation_id, status='held', ...)
+    finally:
+      # Always release the named lock before returning the connection to the pool.
+      conn.query("DO RELEASE_LOCK(?)", lock_name)
 ```
 
 **Why this is correct under concurrency:**
 
-- **Hot-seat races** between different users are decided by the conditional UPDATE's `WHERE status='available'` *inside* the row lock. No read-then-write window; losers get `rowCount=0` → clean `409`.
-- **Multi-seat requests** order their row locks by `label` (ascending), so two concurrent `[A12,A13]` vs `[A13,A12]` reserves can never cycle-wait → no deadlock.
-- **Idempotency atomicity:** the key row and the reservation row commit in the same transaction. There is no state where "key stored, reservation missing" is externally visible.
-- **Per-user limit races** between parallel requests from the *same user* are serialized by the per-`(user, show)` advisory lock in step 0. Without that lock, two parallel reserves on disjoint seats could each read `current=3`, each add one, and both commit (user ends up at 5 on a `limit=4` show). The advisory lock closes that window cheaply.
-- **Transient DB errors** (e.g. `40001` under extreme load) are caught at the request layer and retried once; a second failure maps to `409 seat_taken` or the appropriate domain code — never 5xx.
-
-**Backstop:** a partial unique index makes a double-sell physically impossible even if the algorithm has a bug:
-
-```sql
-CREATE UNIQUE INDEX seats_held_unique
-  ON seats (show_id, label)
-  WHERE status IN ('held','confirmed');
-```
-
-(The regular `UNIQUE (show_id, label)` already enforces label uniqueness. This partial index is additional insurance that same-label two rows cannot both be non-available simultaneously — which can only happen if someone manually introduces duplicate rows.)
+- **Hot-seat races** between different users are decided by the conditional UPDATE's `WHERE status='available'` *inside* the row lock from `SELECT ... FOR UPDATE`. No read-then-write window; losers get `affectedRows=0` → clean `409`.
+- **Multi-seat requests** acquire their row locks via `ORDER BY label` + `FOR UPDATE` (ascending), so two concurrent `[A12,A13]` vs `[A13,A12]` reserves can never cycle-wait → no deadlock.
+- **Idempotency atomicity:** the key row and the reservation row commit in the same transaction. There is no state where "key stored, reservation missing" is externally visible to any observer who waits for commit.
+- **Per-user limit races** between parallel requests from the *same user* are serialized by the per-`(user, show)` named lock in step 0. Without it, two parallel reserves on disjoint seats could each read `current=3`, each add one, and both commit (user ends up at 5 on a `limit=4` show). InnoDB would not raise a conflict because the writes don't overlap on any locked row.
+- **Transient DB errors** — InnoDB deadlock (error 1213) or lock-wait timeout (error 1205) — are caught at the request layer and retried once; a second failure maps to `409 seat_taken` or `409 in_flight` as appropriate. Never 5xx.
+- **The `held_or_confirmed_key` UNIQUE** is a physical backstop: even if application logic ever managed to try two concurrent transitions on the same seat without going through the SELECT FOR UPDATE path, MySQL would reject the second INSERT/UPDATE with a duplicate-key error (1062). The app treats 1062 on seats as `409 seat_taken`.
 
 ---
 
@@ -475,11 +508,11 @@ CREATE UNIQUE INDEX seats_held_unique
 | Scenario | Outcome |
 |---|---|
 | First request with `(user, key, body)` | New reservation created; row stored with `request_hash` + `reservation_id`. |
-| Same `(user, key)`, identical body | `201` with the *same* reservation returned. Byte-for-byte if feasible, otherwise the current snapshot of that reservation. |
+| Same `(user, key)`, identical body | `201` with the *same* reservation returned (byte-for-byte if feasible, otherwise the current snapshot of that reservation). |
 | Same `(user, key)`, different body (different seats or different show) | `409 idempotency_key_conflict`. |
 | Different `user`, same `key` | Independent — composite PK means no collision. |
-| Original tx crashed between INSERT and reservation creation | Transaction rolls back entirely; row never visible. Next retry gets a fresh shot. |
-| Original tx in flight; replay arrives concurrently | Replay's `ON CONFLICT` sees the row, reads `reservation_id=NULL`, returns `409 in_flight`. Client retries after short backoff. In practice this window is sub-millisecond. |
+| Original tx crashed between INSERT IGNORE and reservation creation | Transaction rolls back entirely; row never visible. Next retry gets a fresh shot. |
+| Original tx in flight; replay arrives concurrently | Replay's `GET_LOCK` on the same `(user, show)` blocks until the first commits; then the replay sees the stored `reservation_id` and returns it. In the (vanishingly rare) case the lock timed out, replay sees the row but with `reservation_id=NULL` → `409 in_flight`. |
 
 **`request_hash` computation:** `sha256_hex(show_id + "\n" + sorted(seats).join(","))`. We deliberately do *not* include the token or request_id — those vary by retry and are not part of intent.
 
@@ -504,20 +537,20 @@ Confirmed is terminal — never resurrectable to anything else.
 
 ### 9.2 Lazy expiry (primary)
 
-Every reserve attempt starts with an UPDATE that flips `held → available` for the specific requested seats whose `held_until < now()`. Zero background infrastructure; the next buyer who wants the seat pays the tiny cost of cleaning it up.
+Every reserve attempt starts with an UPDATE that flips `held → available` for the specific requested seats whose `held_until < NOW(6)`. Zero background infrastructure; the next buyer who wants the seat pays the tiny cost of cleaning it up.
 
 ### 9.3 Read-side freshness
 
-`GET /shows/{id}`'s `held` count filters by `held_until > now()` so a stale `held` row still shows as effectively available to a UI. Example:
+`GET /shows/{id}` filters by `held_until > NOW(6)` so a stale `held` row still shows as effectively available to a UI. Example:
 
 ```sql
 SELECT
-  sum(CASE WHEN status='available'
-           OR (status='held' AND held_until < now()) THEN 1 ELSE 0 END) AS available,
-  sum(CASE WHEN status='held' AND held_until >= now()                   THEN 1 ELSE 0 END) AS held,
-  sum(CASE WHEN status='confirmed'                                       THEN 1 ELSE 0 END) AS confirmed,
-  count(*) AS total
-FROM seats WHERE show_id=$1;
+  SUM(CASE WHEN status='available'
+           OR (status='held' AND held_until < NOW(6)) THEN 1 ELSE 0 END) AS available,
+  SUM(CASE WHEN status='held' AND held_until >= NOW(6)                   THEN 1 ELSE 0 END) AS held,
+  SUM(CASE WHEN status='confirmed'                                       THEN 1 ELSE 0 END) AS confirmed,
+  COUNT(*) AS total
+FROM seats WHERE show_id = ?;
 ```
 
 ### 9.4 Expiry can never resurrect a confirmed seat
@@ -530,18 +563,21 @@ Every expiry UPDATE carries `WHERE status='held'`. Confirmed rows are filtered o
 
 Enforced in-transaction. Steps (recap from §7):
 
-1. Acquire `pg_advisory_xact_lock(hashtext(user_id || ':' || show_id))`. This serializes concurrent reserves from the same user on the same show.
+1. Acquire `GET_LOCK('rsv:' || user_id || ':' || show_id, 5)` (5-second wait). On failure returns 0 → return `409 in_flight`.
 2. Count the user's current `held` + `confirmed` seats for this show.
 3. Reject with `409 per_user_limit_exceeded` if `current + requested > per_user_limit`.
 4. Proceed to the seat-lock + UPDATE steps.
+5. In `finally`, call `DO RELEASE_LOCK('rsv:...')` before returning the connection to the pool.
 
-**Why the advisory lock is required (not optional):**
+**Why the named lock is required (not optional):**
 
-Without serialization, two parallel reserves from the same user on *disjoint* seats both read `current=3` (snapshot), each check `3+1 ≤ 4`, each lock a different seat row, and both commit — the user ends up with 5 holds on a `limit=4` show. Postgres won't raise a conflict because the writes don't overlap. REPEATABLE READ and even SERIALIZABLE don't help here cheaply (SERIALIZABLE catches it only via SSI predicate tracking, which gets expensive under 20k burst and raises `40001` broadly).
+Without serialization, two parallel reserves from the same user on *disjoint* seats both read `current=3` (snapshot), each check `3+1 ≤ 4`, each lock a different seat row, and both commit — the user ends up with 5 holds on a `limit=4` show. InnoDB won't raise a conflict because the writes don't overlap on any locked row. REPEATABLE READ in MySQL doesn't close this window either; the `COUNT(*)` is a snapshot read that neither acquires locks nor conflicts with disjoint INSERTs.
 
-The advisory lock is purely in-memory on the DB side (hash → ticket), takes ~microseconds, and is auto-released at commit/rollback. It serializes only within `(user, show)` — different users and different shows do not contend. For the hot-seat scenario (500 *different* users on A12), it adds zero contention — each user's lock key is unique.
+`GET_LOCK` is a MySQL named-lock primitive: cheap (in-memory mutex on the server), keyed by an application-chosen string, serializes only threads asking for the *same* name. It takes a wait-timeout argument (we use 5s). For the hot-seat scenario (500 *different* users on A12), each user's lock name is unique → zero added contention. For the per-user storm (one user firing 10 parallel reserves), the lock name is identical → the 10 attempts serialize cleanly through the critical section one at a time.
 
-**Scope of the lock:** per-`(user, show)` only. Across users and across shows there is no serialization, so throughput remains fully parallel on the only axis that matters (unique seats × unique users).
+**Scope of the lock:** per-`(user, show)` only. Across users and across shows there is no serialization — throughput remains fully parallel on the only axis that matters (unique seats × unique users).
+
+**Lifecycle discipline:** named locks are session-scoped. The `finally` block *must* release the lock before the connection returns to the pool, or the next request routed to that connection will inherit it. The implementation wraps this in a `withUserShowLock(conn, user, show, fn)` helper so no code path can forget.
 
 ---
 
@@ -597,8 +633,9 @@ http_requests_total{method,route,status}
 seats_available{show_id}
 seats_held{show_id}
 seats_confirmed{show_id}
-db_pool_size
-db_pool_in_use
+mysql_pool_size
+mysql_pool_in_use
+mysql_pool_queue_depth
 
 # Histograms
 reservation_latency_seconds{outcome}                            # outcome ∈ {held, declined, replayed}
@@ -622,36 +659,46 @@ Every request emits one line on entry and one on exit:
 ### 12.3 Health endpoints
 
 - `/healthz` — process is up. Never touches dependencies.
-- `/readyz` — `SELECT 1` against DB with 500ms timeout. On failure returns `503` so the platform can take the instance out of rotation.
+- `/readyz` — `SELECT 1` against MySQL with 500ms timeout. On failure returns `503` so the platform can take the instance out of rotation.
 
 ### 12.4 What I'd page on at 2am (goes into WRITEUP)
 
 | Alert | Why |
 |---|---|
 | `5xx rate > 0.5% over 2m` | Any sustained 5xx = correctness bar broken. |
-| `/readyz` failing > 1m | DB is unreachable; we're refusing writes, which is correct, but needs human attention. |
+| `/readyz` failing > 1m | DB is unreachable; we're refusing writes (correct) but needs human attention. |
 | `seats_available + seats_held + seats_confirmed != total_seats` | Reconciliation drift — should be *impossible*. If it fires, there's a bug. |
 | `p99 reservation_latency > 500ms over 5m` | Load above design envelope; investigate pool / DB. |
-| `db_pool_in_use == db_pool_size for 30s` | Pool exhaustion imminent. |
+| `mysql_pool_in_use == mysql_pool_size for 30s` | Pool exhaustion imminent. |
+| `innodb_row_lock_waits spiking` | Hot-seat contention or lock discipline issue. |
 
 ---
 
 ## 13. Deployment topology
 
-### 13.1 Fly.io config (`fly.toml`)
+### 13.1 Fly.io config
 
-- Region: `bom` (ap-south, close to Neon's Mumbai/Singapore).
+**App machine (`fly.toml` for the app):**
+- Region: `bom` (ap-south).
 - Machine: shared-cpu-1x, 256MB.
 - `min_machines_running = 1` — no cold start on reviewer's first hit.
 - Internal port 8080, forced HTTPS.
 - `[[services.http_checks]]` → `/healthz` every 10s.
 - Secrets: `DATABASE_URL`, `TOKEN_SECRET`, `ADMIN_TOKEN`.
 
-### 13.2 Neon
+**DB machine (separate Fly app `seatres-db`):**
+- Region: same (`bom`).
+- Machine: shared-cpu-1x, 512MB (MySQL needs more than the app).
+- 3GB persistent volume mounted at `/var/lib/mysql`.
+- Not exposed to the public internet — bound to Fly's private 6PN network.
+- `my.cnf` tuned for small instance: `innodb_buffer_pool_size=256M`, `max_connections=200`, `innodb_flush_log_at_trx_commit=1` (default — safety over speed; we're not benchmarking raw TPS).
+- Healthcheck: `mysqladmin ping` every 10s.
 
-- Free tier, single project, single branch.
-- Pooled connection string (`?sslmode=require&pgbouncer=true`) used by the app so burst spikes don't exhaust direct connections.
-- Separate direct connection string for the migrations script.
+### 13.2 Connection string
+
+`DATABASE_URL=mysql://app:<password>@seatres-db.internal:3306/seatres`
+
+The internal `.internal` hostname resolves via Fly 6PN DNS. TLS is optional on the private network; we leave it off to keep things simple. Pool size tuned to 50 (well under MySQL's `max_connections`).
 
 ### 13.3 Dockerfile
 
@@ -676,27 +723,48 @@ Stage runner:
 ```yaml
 services:
   db:
-    image: postgres:16-alpine
-    environment: { POSTGRES_PASSWORD: devpass }
-    ports: ["5432:5432"]
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=caching_sha2_password
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=200
+    environment:
+      MYSQL_ROOT_PASSWORD: devroot
+      MYSQL_DATABASE: seatres
+      MYSQL_USER: app
+      MYSQL_PASSWORD: devpass
+    ports:
+      # Local 3307 → container 3306 (host 3306 is reserved for the org DB)
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "app", "-pdevpass"]
       interval: 2s
+      timeout: 2s
+      retries: 20
   app:
     build: .
-    depends_on: { db: { condition: service_healthy } }
+    depends_on:
+      db: { condition: service_healthy }
     environment:
-      DATABASE_URL: postgres://postgres:devpass@db:5432/postgres
+      DATABASE_URL: mysql://app:devpass@db:3306/seatres
       TOKEN_SECRET: dev-secret
       ADMIN_TOKEN: dev-admin
-    ports: ["8080:8080"]
+    ports:
+      - "8080:8080"
+
+volumes:
+  mysql_data:
 ```
 
-A single `docker compose up` after a clean clone brings the full stack online with migrations auto-applied on boot.
+A single `docker compose up` after a clean clone brings the full stack online with migrations auto-applied on boot. The host-side port `3307` is intentional — on the dev machine, `3306` is reserved for an unrelated org MySQL instance.
 
 ### 13.5 Migrations
 
 Plain SQL files in `src/db/migrations/`, applied in filename order by a tiny bootstrap routine on process start. No ORM, no migration framework. For a 1-day project this is simplest and auditable.
+
+A `schema_migrations(filename VARCHAR(255) PRIMARY KEY, applied_at DATETIME(6))` table tracks what's been applied. The bootstrap runs each not-yet-applied `.sql` file in a transaction, then inserts the filename.
 
 ---
 
@@ -739,32 +807,34 @@ paytm-seat-reservation/
 ├── WRITEUP.md
 ├── Dockerfile
 ├── docker-compose.yml
-├── fly.toml
+├── fly.app.toml                             # app machine
+├── fly.db.toml                              # db machine
 ├── package.json
 ├── pnpm-lock.yaml
 ├── tsconfig.json
 ├── .env.example
-├── burst.sh                                # thin wrapper: node dist/scripts/burst.js
+├── burst.sh                                 # thin wrapper: node dist/scripts/burst.js
 ├── src/
-│   ├── server.ts                           # Fastify bootstrap
-│   ├── config.ts                           # env parsing (zod)
+│   ├── server.ts                            # Fastify bootstrap
+│   ├── config.ts                            # env parsing (zod)
 │   ├── db/
-│   │   ├── pool.ts
+│   │   ├── pool.ts                          # mysql2 pool
+│   │   ├── with-user-show-lock.ts           # GET_LOCK / RELEASE_LOCK helper
 │   │   ├── migrate.ts
 │   │   └── migrations/
 │   │       ├── 001_init.sql
-│   │       └── 002_partial_unique_index.sql
+│   │       └── 002_held_unique_backstop.sql  # the generated-column + UNIQUE
 │   ├── auth/
-│   │   ├── token.ts                        # HMAC sign/verify
+│   │   ├── token.ts                         # HMAC sign/verify
 │   │   └── middleware.ts
 │   ├── domain/
 │   │   ├── shows.ts
-│   │   ├── reservations.ts                 # the atomic reserve logic
+│   │   ├── reservations.ts                  # the atomic reserve logic
 │   │   └── idempotency.ts
 │   ├── routes/
 │   │   ├── shows.ts
 │   │   ├── reservations.ts
-│   │   └── ops.ts                          # /healthz, /readyz, /metrics
+│   │   └── ops.ts                           # /healthz, /readyz, /metrics
 │   ├── observability/
 │   │   ├── metrics.ts
 │   │   └── logger.ts
@@ -778,11 +848,11 @@ paytm-seat-reservation/
     │   ├── idempotency.test.ts
     │   └── reserve-decision.test.ts
     └── integration/
-        ├── contention.test.ts              # 500-way race on single seat
+        ├── contention.test.ts               # 500-way race on single seat
         ├── per-user-limit.test.ts
         ├── idempotency.test.ts
         ├── expiry.test.ts
-        └── ownership.test.ts               # spoofed body cannot act as another user
+        └── ownership.test.ts                # spoofed body cannot act as another user
 ```
 
 ---
@@ -793,24 +863,24 @@ Each row ends with a git commit — the reviewer should see realistic progress.
 
 | # | Step | Est. | Commit message |
 |---|---|---|---|
-| 1 | Scaffold: tsconfig, Fastify, pino, pg, Dockerfile, docker-compose, migrations runner, `/healthz`, `/readyz` | 45m | `chore: scaffold Fastify + pg + docker-compose` |
-| 2 | DB schema (001_init.sql) + partial unique index (002) | 30m | `feat(db): schema for shows/seats/reservations/idempotency` |
+| 1 | Scaffold: tsconfig, Fastify, pino, mysql2, Dockerfile, docker-compose (MySQL on 3307), migrations runner, `/healthz`, `/readyz` | 45m | `chore: scaffold Fastify + mysql2 + docker-compose` |
+| 2 | DB schema (001_init.sql) + generated-column UNIQUE backstop (002) | 30m | `feat(db): schema for shows/seats/reservations/idempotency` |
 | 3 | `POST /shows` (admin) + `GET /shows/:id` + seed script + integration test | 30m | `feat(shows): create + read` |
 | 4 | Auth: HMAC token sign/verify, middleware, admin header, mint-tokens script | 20m | `feat(auth): HMAC bearer tokens and admin guard` |
 | 5 | `POST /shows/:id/reserve` single-seat happy path (no idempotency yet) + unit test | 45m | `feat(reserve): single-seat happy path` |
 | 6 | Multi-seat all-or-nothing with sorted locking + integration test | 30m | `feat(reserve): multi-seat with deterministic lock order` |
-| 7 | Per-user limit enforcement + test | 20m | `feat(reserve): per-user limit` |
+| 7 | Per-user limit enforcement with `GET_LOCK` helper + test | 30m | `feat(reserve): per-user limit via named lock` |
 | 8 | Idempotency key handling (replay + conflict) + tests | 45m | `feat(reserve): idempotency contract` |
 | 9 | Hold TTL + lazy expiry + `cancel` + `confirm` endpoints + tests | 45m | `feat(reservations): confirm, cancel, lazy expiry` |
 | 10 | prom-client metrics + reconciliation gauges | 30m | `feat(obs): prometheus metrics` |
 | 11 | Burst script with all scenarios | 60m | `feat(scripts): one-command burst harness` |
 | 12 | Local contention test (500-way race) proves correctness | 45m | `test: 500-way concurrent reserve on single seat` |
-| 13 | Dockerfile prod build + Fly deploy + Neon DB + env/secrets | 60m | `chore(deploy): fly.io + neon` |
+| 13 | Dockerfile prod build + Fly deploy (app + db machines, volume) + secrets | 75m | `chore(deploy): fly.io app + self-hosted mysql on volume` |
 | 14 | Live burst against deployed URL; tune pool sizes until zero 5xx | 45m | `fix(perf): tune pool for 20k burst` |
 | 15 | WRITEUP.md + README polish | 45m | `docs: README + WRITEUP` |
 | **stretch** | Ops dashboard served at `/` | ≤120m | `feat(ui): live ops dashboard` |
 
-Total P0: ~8h30. Dashboard is additive and skippable.
+Total P0: ~9 hours. Dashboard is additive and skippable.
 
 ---
 
@@ -820,13 +890,14 @@ Full trade-off discussion was in the brainstorming chat; summarized decisions be
 
 | Decision | Chosen | Why |
 |---|---|---|
-| Atomic mechanism | Conditional UPDATE + partial unique index backstop | Cleanest single-step decision for user-named seats. |
-| Store | Postgres only | One source of truth; idempotency + seat state + per-user count all in one tx. |
+| Atomic mechanism | Conditional UPDATE + generated-column UNIQUE backstop | Cleanest single-step decision for user-named seats; MySQL's partial-index-equivalent via generated column. |
+| Store | MySQL 8 (InnoDB) | User choice. All concurrency primitives we need (row locks via `FOR UPDATE`, named locks via `GET_LOCK`, generated columns + UNIQUE) are present. |
+| Per-user serialization | `GET_LOCK` named lock | MySQL's equivalent to a Postgres advisory lock. Session-scoped so we release in `finally`. |
 | Hold model | TTL + two-step confirm | Realistic for payments; non-trivial `/confirm` is good interview surface area. |
 | Multi-seat | All-or-nothing | Trivial to document and defend; invariant easy to prove under concurrency. |
 | Expiry | Lazy, in-band | Zero background infra; correctness comes from SQL, not a worker. |
 | Auth | HMAC opaque bearer | No DB round-trip on hot path; 20 lines of code. |
-| Deploy | Fly.io + Neon | Always-on free tier + Postgres with built-in pooling. |
+| Deploy | Fly.io app + self-hosted MySQL on Fly volume | Always-on free tier; standard MySQL semantics (no PlanetScale / TiDB protocol quirks); no managed MySQL free tier worth using in 2026. |
 | CAP | CP | Correct for a system of record on unique inventory. |
 
 ---
@@ -846,21 +917,24 @@ We trade **availability** for **correctness**, deliberately. Any AP alternative 
 
 | Risk | Mitigation |
 |---|---|
-| Connection pool exhaustion under 20k burst | Use Neon's built-in pooler; cap `max` pool size to Neon's limit; keep per-request DB time short. |
-| Postgres `40001` serialization failures under heavy contention | Catch and retry once at request layer; if second attempt fails, return `409 seat_taken`. Never 500. |
-| Fly cold start fails deploy-check | `min_machines_running=1`; `/healthz` returns 200 within 2s of boot. |
+| Connection pool exhaustion under 20k burst | `mysql2` pool sized to 50 against MySQL's `max_connections=200`; keep per-request DB time short; queue-depth gauge for visibility. |
+| InnoDB deadlock (1213) or lock-wait timeout (1205) under heavy contention | Catch and retry once at request layer; if second attempt fails, return `409 seat_taken` or `409 in_flight`. Never 5xx. |
+| `GET_LOCK` not released due to code path bug | Centralized `withUserShowLock(conn, ...)` helper puts `RELEASE_LOCK` in a `finally` block. Connection drop also releases it. Metric for in-flight locks aids debugging. |
+| Fly cold start fails deploy-check | `min_machines_running=1` on the app; DB volume persists across machine restarts; `/healthz` returns 200 within 2s of boot. |
+| DB machine OOM under burst | MySQL on 512MB instance with `innodb_buffer_pool_size=256M`; verify under local burst before deploy. Fallback: upsize to 1GB machine (still within free allowance). |
 | Partial-success ambiguity | All-or-nothing explicitly documented in README + WRITEUP; integration test enforces it. |
-| Idempotency "key stored, reservation missing" window | Both committed in the same tx. Replay during that window sees `reservation_id=NULL` → `409 in_flight`, extremely rare. |
-| Reviewer tests from a distant region | Deploy in region close to Neon; accept one-time latency difference. |
-| Fly / Neon free-tier limits hit mid-review | Monitor allowance; have fallback plan documented. |
+| Idempotency "key stored, reservation missing" window | Both committed in the same tx; replay during that window sees `reservation_id=NULL` → `409 in_flight`, extremely rare because `GET_LOCK` serializes. |
+| Self-hosted MySQL has no managed backups | Out of scope for a 1-day exercise; documented in open questions. For prod we'd move to a managed MySQL or run `mysqldump` to Fly volume on cron. |
+| Local dev MySQL collides with org DB on 3306 | Compose binds host-side `3307:3306`; documented in README. |
 
 ---
 
 ## 20. Open questions / future work
 
 - **Confirm step authentication.** v1 lets any token-holder of the owning user confirm. A real payments flow would require a payment-intent cryptographic hand-off from the PSP. Out of scope.
-- **Multi-region.** Single Postgres is a single region. For a real on-sale at scale we'd move to Postgres read replicas for `GET /shows/:id` and keep the primary for writes.
-- **Reservation TTL cleanup for `idempotency_keys`.** v1 keeps all keys. A daily `DELETE WHERE created_at < now() - interval '24 hours'` is a trivial follow-up.
+- **Multi-region.** Single MySQL is a single region. For a real on-sale at scale we'd move to MySQL read replicas for `GET /shows/:id` and keep the primary for writes.
+- **Managed MySQL / backups.** v1 uses self-hosted MySQL on a Fly volume with no backup strategy. A real deploy would use a managed MySQL offering (AWS RDS / PlanetScale / Aiven) with PITR.
+- **TTL cleanup for `idempotency_keys`.** v1 keeps all keys. A daily `DELETE WHERE created_at < NOW(6) - INTERVAL 1 DAY` is a trivial follow-up.
 - **Backpressure.** Under truly extreme load we'd add a token-bucket limiter at the Fastify layer to shed load gracefully with `429` instead of growing the pool queue.
 - **Seat holds you can extend.** Not in scope. A `PATCH /reservations/:id/extend-hold` would be a natural follow-up.
 
