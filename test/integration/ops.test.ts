@@ -8,4 +8,13 @@ describe('ops', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
   });
+
+  it('GET /metrics returns Prometheus text with http_requests_total', async () => {
+    const app = createApp();
+    await request(app).get('/healthz');
+    const res = await request(app).get('/metrics');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/plain/);
+    expect(res.text).toContain('http_requests_total');
+  });
 });
