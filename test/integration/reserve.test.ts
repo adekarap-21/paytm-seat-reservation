@@ -118,4 +118,40 @@ describe('reserve (single-seat)', () => {
     expect(r.status).toBe(409);
     expect(r.body.error).toBe('per_user_limit');
   });
+
+  it('idempotent replay returns 200 with original reservation', async () => {
+    const sid = await createShow(['A1','A2']);
+    const app = createApp();
+    const r1 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A1'], idempotency_key:'kX' });
+    const r2 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A1'], idempotency_key:'kX' });
+    expect(r1.status).toBe(201);
+    expect(r2.status).toBe(200);
+    expect(r2.body.reservation_id).toBe(r1.body.reservation_id);
+  });
+
+  it('same key with different body returns 409 idempotency_body_mismatch', async () => {
+    const sid = await createShow(['A1','A2','A3']);
+    const app = createApp();
+    await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A1'], idempotency_key:'kY' });
+    const r = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A2'], idempotency_key:'kY' });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe('idempotency_body_mismatch');
+  });
+
+  // Review Focus #2: same key across different users is independent
+  it('test_idem_key_scoped_per_user', async () => {
+    const sid = await createShow(['A1','A2']);
+    const app = createApp();
+    const r1 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A1'], idempotency_key:'shared' });
+    const r2 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_2').send({ seats:['A2'], idempotency_key:'shared' });
+    expect(r1.status).toBe(201);
+    expect(r2.status).toBe(201);
+    expect(r1.body.reservation_id).not.toBe(r2.body.reservation_id);
+  });
 });

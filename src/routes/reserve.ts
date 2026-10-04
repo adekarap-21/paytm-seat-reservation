@@ -1,35 +1,24 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { createHash } from 'node:crypto';
 import { requireUser } from '../middleware/access.js';
 import { reserve } from '../domain/reserve.js';
 import { ValidationError } from '../domain/errors.js';
+import { normalize, hashBody, ReserveBody } from '../domain/idempotency.js';
 import {
   reservationsCounter, reserveLatencyHistogram,
   seatsAvailableGauge, seatsConfirmedGauge,
 } from '../metrics.js';
 import { pool } from '../db.js';
 
-export const ReserveBody = z.object({
-  seats: z.array(z.string().min(1).max(16)).min(1).max(50)
-    .refine((a) => new Set(a).size === a.length, 'duplicate seat ids'),
-  idempotency_key: z.string().min(1).max(128),
-});
-
-// ponytail: inline helper; Task 9 replaces with import from src/domain/idempotency.ts
-function normalizeAndHash(body: unknown): { normalized: { seats: string[]; idempotency_key: string }; hash: string } {
-  const parsed = ReserveBody.parse(body);
-  const normalized = { seats: [...parsed.seats].sort(), idempotency_key: parsed.idempotency_key.trim() };
-  const hash = createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
-  return { normalized, hash };
-}
+export { ReserveBody };
 
 export const reserveRouter = Router();
 
 reserveRouter.post('/shows/:id/reserve', requireUser, async (req, res, next) => {
   const t0 = process.hrtime.bigint();
   try {
-    const { normalized, hash } = normalizeAndHash(req.body);
+    const normalized = normalize(req.body);
+    const hash = hashBody(normalized);
     const result = await reserve({
       show_id: req.params.id, user_id: req.userId!,
       seats: normalized.seats, idem_key: normalized.idempotency_key, body_hash: hash,
