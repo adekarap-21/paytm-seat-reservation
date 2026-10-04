@@ -9,6 +9,7 @@ import {
   seatsAvailableGauge, seatsConfirmedGauge,
 } from '../metrics.js';
 import { pool } from '../db.js';
+import { publish } from '../events.js';
 
 export { ReserveBody };
 
@@ -27,6 +28,13 @@ reserveRouter.post('/shows/:id/reserve', requireUser, async (req, res, next) => 
     const elapsed = Number(process.hrtime.bigint() - t0) / 1e9;
     reserveLatencyHistogram.observe({ show_id: req.params.id }, elapsed);
     await refreshSeatGauges(req.params.id);
+    if (result.kind === 'created') {
+      const now = result.created_at.toISOString();
+      for (const seat of result.seats) {
+        publish({ type: 'seat', show_id: result.show_id, seat_id: seat, status: 'confirmed', user_id: result.user_id, at: now });
+      }
+      publish({ type: 'reservation', show_id: result.show_id, reservation_id: result.reservation_id, user_id: result.user_id, seats: result.seats, outcome: 'confirmed', at: now });
+    }
     res.status(result.kind === 'replay' ? 200 : 201).json({
       reservation_id: result.reservation_id,
       show_id: result.show_id,

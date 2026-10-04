@@ -3,6 +3,7 @@ import { requireUser } from '../middleware/access.js';
 import { cancelReservation } from '../domain/cancel.js';
 import { cancellationsCounter, seatsAvailableGauge, seatsConfirmedGauge } from '../metrics.js';
 import { pool } from '../db.js';
+import { publish } from '../events.js';
 
 export const cancelRouter = Router();
 
@@ -18,6 +19,14 @@ cancelRouter.post('/reservations/:id/cancel', requireUser, async (req, res, next
     for (const r of rows) { if (r.status === 'available') a = r.c; if (r.status === 'confirmed') c = r.c; }
     seatsAvailableGauge.set({ show_id: out.show_id }, a);
     seatsConfirmedGauge.set({ show_id: out.show_id }, c);
+    const [cancelledSeats] = await pool.query<any[]>(
+      'SELECT seat_id FROM reservation_seats WHERE reservation_id=? ORDER BY seat_id', [out.reservation_id],
+    );
+    const at = out.cancelled_at.toISOString();
+    for (const s of cancelledSeats as any[]) {
+      publish({ type: 'seat', show_id: out.show_id, seat_id: s.seat_id, status: 'available', at });
+    }
+    publish({ type: 'reservation', show_id: out.show_id, reservation_id: out.reservation_id, user_id: req.userId!, seats: (cancelledSeats as any[]).map((s: any) => s.seat_id), outcome: 'cancelled', at });
     res.json({ reservation_id: out.reservation_id, status: 'cancelled', cancelled_at: out.cancelled_at.toISOString() });
   } catch (e) { next(e); }
 });
