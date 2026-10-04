@@ -7,6 +7,7 @@ import { logger } from './logger.js';
 import { registry } from './metrics.js';
 import { config } from './config.js';
 import { showsRouter } from './routes/shows.js';
+import { reserveRouter } from './routes/reserve.js';
 
 export function createApp(): Express {
   const app = express();
@@ -21,6 +22,7 @@ export function createApp(): Express {
     res.end(await registry.metrics());
   });
   app.use(showsRouter);
+  app.use(reserveRouter);
   app.use(errorHandler);
   return app;
 }
