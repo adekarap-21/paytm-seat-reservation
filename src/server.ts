@@ -10,6 +10,7 @@ import { showsRouter } from './routes/shows.js';
 import { reserveRouter } from './routes/reserve.js';
 import { cancelRouter } from './routes/cancel.js';
 import { streamRouter } from './routes/stream.js';
+import { dashboardRouter } from './routes/dashboard.js';
 
 export function createApp(): Express {
   const app = express();
@@ -27,6 +28,7 @@ export function createApp(): Express {
   app.use(reserveRouter);
   app.use(cancelRouter);
   app.use(streamRouter);
+  app.use(dashboardRouter);
   app.use(errorHandler);
   return app;
 }

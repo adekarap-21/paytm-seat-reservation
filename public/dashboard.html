@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seat Reservation — Live</title>
+<style>
+  :root { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; }
+  body { margin: 0; padding: 0; background: #fff; color: #111; font-size: 14px; }
+  header { display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 18px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  .status { display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; padding: 3px 10px; border-radius: 999px; background: #ecfdf5; color: #065f46; }
+  .status::before { content: "●"; }
+  .status.recon { background: #fef3c7; color: #92400e; }
+  .status.off   { background: #fee2e2; color: #991b1b; }
+  .counts { display: flex; gap: 16px; font-size: 13px; color: #374151; }
+  .counts b { color: #111; }
+  .reconciled { color: #047857; font-weight: 600; }
+  .drift      { color: #991b1b; font-weight: 600; }
+  main { display: grid; grid-template-columns: 1fr 280px; gap: 0; }
+  #seat-grid-wrap { padding: 14px 18px; }
+  #seat-grid { border-collapse: separate; border-spacing: 4px; }
+  td.seat { text-align: center; padding: 8px 2px; font-size: 10px; font-weight: 600;
+    border-radius: 4px; background: #e5e7eb; border: 1px solid #9ca3af; color: #374151;
+    min-width: 48px; transition: box-shadow 300ms; }
+  td.seat .lbl { display: block; font-size: 9px; font-weight: 400; color: #6b7280; }
+  td.seat.held { background: #fde68a; border-color: #f59e0b; color: #78350f; }
+  td.seat.confirmed { background: #fecaca; border-color: #dc2626; color: #7f1d1d; }
+  td.seat.pulse { box-shadow: 0 0 0 3px rgba(220,38,38,0.35); }
+  aside { border-left: 1px solid #e5e7eb; padding: 14px; background: #fafafa; font-size: 12px; }
+  aside h2 { font-size: 12px; margin: 0 0 8px 0; color: #374151; text-transform: uppercase; letter-spacing: 0.3px; }
+  aside ol { list-style: none; padding: 0; margin: 0; max-height: 70vh; overflow-y: auto; }
+  aside li { padding: 4px 0; border-bottom: 1px dashed #e5e7eb; display: flex; gap: 6px; }
+  aside .t { color: #6b7280; font-variant-numeric: tabular-nums; }
+  .ev-confirmed { color: #7f1d1d; font-weight: 600; }
+  .ev-cancelled { color: #4b5563; font-weight: 600; }
+  .empty { padding: 60px 20px; text-align: center; color: #6b7280; }
+  .empty input { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 4px; margin-top: 12px; min-width: 240px; }
+  .empty button { padding: 7px 14px; border: 1px solid #111; background: #111; color: #fff; border-radius: 4px; cursor: pointer; margin-left: 6px; }
+  @media (prefers-reduced-motion: reduce) {
+    td.seat { transition: none; }
+    td.seat.pulse { box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div style="display:flex; align-items:center; gap:10px;">
+    <h1 id="show-name">—</h1>
+    <span id="conn" class="status">connecting…</span>
+  </div>
+  <div class="counts" id="counts" style="display:none;">
+    <span>available <b id="c-a">—</b></span>
+    <span>held <b id="c-h">—</b></span>
+    <span>confirmed <b id="c-c">—</b></span>
+    <span>total <b id="c-t">—</b></span>
+    <span id="reconciled" class="reconciled">✓</span>
+  </div>
+</header>
+<main id="main">
+  <div id="empty" class="empty">
+    <h3>Pick a show to watch</h3>
+    <div>Paste a show id and hit load.</div>
+    <div><input id="show-input" placeholder="sh_01HV8K…"><button id="show-load">load</button></div>
+  </div>
+</main>
+
+<script type="module">
+const qs = new URLSearchParams(location.search);
+const showId = qs.get('show');
+const $ = (id) => document.getElementById(id);
+
+if (!showId) {
+  $('show-load').addEventListener('click', () => {
+    const v = $('show-input').value.trim();
+    if (v) location.search = `?show=${encodeURIComponent(v)}`;
+  });
+} else {
+  main();
+}
+
+function cell(seatId) {
+  const td = document.createElement('td');
+  td.className = 'seat';
+  td.id = `s-${seatId}`;
+  td.innerHTML = `${seatId}<span class="lbl"> </span>`;
+  return td;
+}
+
+function render(seats) {
+  const main = $('main');
+  main.innerHTML = `
+    <div id="seat-grid-wrap"><table id="seat-grid"><tbody id="grid-body"></tbody></table></div>
+    <aside><h2>recent</h2><ol id="feed"></ol></aside>
+  `;
+  // group by row-prefix
+  const groups = {};
+  for (const s of seats) {
+    const row = s.seat_id.replace(/\d+$/, '');
+    (groups[row] ??= []).push(s);
+  }
+  const body = $('grid-body');
+  for (const row of Object.keys(groups).sort()) {
+    const tr = document.createElement('tr');
+    for (const s of groups[row]) {
+      const td = cell(s.seat_id);
+      applyStatus(td, s.status);
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+}
+
+function applyStatus(td, status) {
+  td.classList.remove('held','confirmed');
+  if (status === 'held') td.classList.add('held');
+  if (status === 'confirmed') td.classList.add('confirmed');
+  const lbl = td.querySelector('.lbl');
+  lbl.textContent = status === 'confirmed' ? 'C' : status === 'held' ? 'H' : ' ';
+}
+
+function pulse(td) {
+  td.classList.add('pulse');
+  setTimeout(() => td.classList.remove('pulse'), 500);
+}
+
+function updateCounts(c) {
+  $('c-a').textContent = c.available;
+  $('c-h').textContent = c.held;
+  $('c-c').textContent = c.confirmed;
+  $('c-t').textContent = c.total;
+  const ok = (c.available + c.held + c.confirmed) === c.total;
+  const rec = $('reconciled');
+  rec.textContent = ok ? '✓ reconciled' : '✗ drift';
+  rec.className = ok ? 'reconciled' : 'drift';
+  $('counts').style.display = 'flex';
+}
+
+function addFeed(ev) {
+  const li = document.createElement('li');
+  const t = new Date(ev.at).toISOString().slice(11,23);
+  const cls = ev.outcome === 'confirmed' ? 'ev-confirmed' : 'ev-cancelled';
+  li.innerHTML = `<span class="t">${t}</span> <span class="${cls}">${ev.outcome}</span> <span>${ev.seats.join(',')} by u_${ev.user_id}</span>`;
+  const feed = $('feed');
+  feed.prepend(li);
+  while (feed.children.length > 20) feed.removeChild(feed.lastChild);
+}
+
+async function main() {
+  $('show-name').textContent = showId;
+  const es = new EventSource(`/shows/${encodeURIComponent(showId)}/stream`);
+  es.onopen = () => { $('conn').textContent = 'live'; $('conn').className = 'status'; };
+  es.onerror = () => { $('conn').textContent = 'reconnecting…'; $('conn').className = 'status recon'; };
+  es.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === 'baseline') {
+      render(ev.seats);
+      updateCounts(ev.counts);
+    } else if (ev.type === 'seat') {
+      const td = document.getElementById(`s-${ev.seat_id}`);
+      if (td) { applyStatus(td, ev.status); pulse(td); }
+    } else if (ev.type === 'reservation') {
+      addFeed(ev);
+      // request a fresh baseline periodically for counts via a quick fetch
+      fetch(`/shows/${encodeURIComponent(showId)}`).then(r=>r.json()).then(d => updateCounts(d.counts));
+    }
+  };
+}
+</script>
+</body>
+</html>
