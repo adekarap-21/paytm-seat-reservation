@@ -17,4 +17,10 @@ describe('ops', () => {
     expect(res.headers['content-type']).toMatch(/text\/plain/);
     expect(res.text).toContain('http_requests_total');
   });
+
+  it('GET /readyz returns 200 when DB is up', async () => {
+    const res = await request(createApp()).get('/readyz');
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+  });
 });
