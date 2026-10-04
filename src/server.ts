@@ -8,6 +8,7 @@ import { registry } from './metrics.js';
 import { config } from './config.js';
 import { showsRouter } from './routes/shows.js';
 import { reserveRouter } from './routes/reserve.js';
+import { cancelRouter } from './routes/cancel.js';
 
 export function createApp(): Express {
   const app = express();
@@ -23,6 +24,7 @@ export function createApp(): Express {
   });
   app.use(showsRouter);
   app.use(reserveRouter);
+  app.use(cancelRouter);
   app.use(errorHandler);
   return app;
 }
