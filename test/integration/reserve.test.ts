@@ -72,4 +72,27 @@ describe('reserve (single-seat)', () => {
     expect(r.status).toBe(201);
     expect(r.body.user_id).toBe(3);
   });
+
+  it('reserves multiple seats all-or-nothing (success)', async () => {
+    const sid = await createShow(['A1','A2','A3']);
+    const r = await request(createApp()).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A2','A1'], idempotency_key:'k1' });
+    expect(r.status).toBe(201);
+    expect(r.body.seats).toEqual(['A1','A2']);          // sorted by normalize
+    expect(r.body.amount_paise).toBe(200);
+  });
+
+  it('rejects whole multi-seat request when one is taken (all-or-nothing)', async () => {
+    const sid = await createShow(['A1','A2','A3']);
+    await request(createApp()).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A2'], idempotency_key:'k1' });
+    const r = await request(createApp()).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_2').send({ seats:['A1','A2','A3'], idempotency_key:'k2' });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe('seat_taken');
+    // A1 and A3 should still be available
+    const g = await request(createApp()).get(`/shows/${sid}`);
+    const map = Object.fromEntries(g.body.seats.map((s:any)=>[s.seat_id, s.status]));
+    expect(map).toEqual({ A1: 'available', A2: 'confirmed', A3: 'available' });
+  });
 });

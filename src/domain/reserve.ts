@@ -12,8 +12,8 @@ export interface ReserveSuccess {
 }
 
 export async function reserve(input: ReserveInput): Promise<ReserveSuccess> {
-  if (input.seats.length !== 1) throw new ValidationError('single-seat only in this build'); // ponytail: temporary guard, Task 7 removes it
-  const seat = input.seats[0]!;
+  if (input.seats.length < 1) throw new ValidationError('at least one seat required');
+  const sorted = [...input.seats].sort();   // defensive — route already sorts
 
   return withTx(async (conn) => {
     const [shows] = await conn.query<any[]>('SELECT id, price_paise FROM shows WHERE id=?', [input.show_id]);
@@ -21,34 +21,48 @@ export async function reserve(input: ReserveInput): Promise<ReserveSuccess> {
     const price = shows[0].price_paise as number;
 
     const reservation_id = ulid();
-    const [upd] = await conn.query<any>(
-      `UPDATE seats SET status='confirmed', user_id=?, reservation_id=?
-       WHERE show_id=? AND seat_id=? AND status='available'`,
-      [input.user_id, reservation_id, input.show_id, seat],
-    );
-    if ((upd.affectedRows ?? 0) !== 1) {
-      throw new ConflictError('seat_taken', 'seat already taken');
+    for (const seat of sorted) {
+      let upd: any;
+      try {
+        [upd] = await conn.query<any>(
+          `UPDATE seats SET status='confirmed', user_id=?, reservation_id=?
+           WHERE show_id=? AND seat_id=? AND status='available'`,
+          [input.user_id, reservation_id, input.show_id, seat],
+        );
+      } catch (e: any) {
+        if (e?.code === 'ER_LOCK_WAIT_TIMEOUT') {
+          throw new ConflictError('seat_taken', 'seat lock wait timeout');
+        }
+        throw e;
+      }
+      if ((upd.affectedRows ?? 0) !== 1) {
+        throw new ConflictError('seat_taken', `seat ${seat} not available`);
+      }
     }
 
     await conn.query(
       `INSERT INTO reservations (id, show_id, user_id, idem_key, body_hash, amount_paise, status)
        VALUES (?, ?, ?, ?, ?, ?, 'confirmed')`,
-      [reservation_id, input.show_id, input.user_id, input.idem_key, input.body_hash, price],
+      [reservation_id, input.show_id, input.user_id, input.idem_key, input.body_hash, price * sorted.length],
     );
-    await conn.query(
-      `INSERT INTO reservation_seats (reservation_id, show_id, seat_id) VALUES (?, ?, ?)`,
-      [reservation_id, input.show_id, seat],
-    );
+    const seatRows = sorted.map((s) => [reservation_id, input.show_id, s]);
+    try {
+      await conn.query(
+        `INSERT INTO reservation_seats (reservation_id, show_id, seat_id) VALUES ?`,
+        [seatRows],
+      );
+    } catch (e: any) {
+      if (e?.code === 'ER_DUP_ENTRY') {
+        // ponytail: belt+suspenders backstop — schema uniq_active_seat tripped after UPDATE missed it
+        throw new ConflictError('seat_taken', 'seat already active elsewhere');
+      }
+      throw e;
+    }
 
     return {
-      kind: 'created',
-      reservation_id,
-      show_id: input.show_id,
-      user_id: input.user_id,
-      seats: [seat],
-      amount_paise: price,
-      status: 'confirmed',
-      created_at: new Date(),
+      kind: 'created', reservation_id,
+      show_id: input.show_id, user_id: input.user_id, seats: sorted,
+      amount_paise: price * sorted.length, status: 'confirmed', created_at: new Date(),
     };
   });
 }
