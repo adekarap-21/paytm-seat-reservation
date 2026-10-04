@@ -95,4 +95,27 @@ describe('reserve (single-seat)', () => {
     const map = Object.fromEntries(g.body.seats.map((s:any)=>[s.seat_id, s.status]));
     expect(map).toEqual({ A1: 'available', A2: 'confirmed', A3: 'available' });
   });
+
+  it('enforces per-user limit (sequential)', async () => {
+    const sid = await createShow(['A1','A2','A3','A4','A5'], 2);
+    const app = createApp();
+    const r1 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A1'], idempotency_key:'k1' });
+    const r2 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A2'], idempotency_key:'k2' });
+    const r3 = await request(app).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A3'], idempotency_key:'k3' });
+    expect(r1.status).toBe(201);
+    expect(r2.status).toBe(201);
+    expect(r3.status).toBe(409);
+    expect(r3.body.error).toBe('per_user_limit');
+  });
+
+  it('rejects multi-seat request that would exceed limit', async () => {
+    const sid = await createShow(['A1','A2','A3','A4','A5'], 2);
+    const r = await request(createApp()).post(`/shows/${sid}/reserve`)
+      .set('Authorization','Bearer tok_user_1').send({ seats:['A1','A2','A3'], idempotency_key:'k1' });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe('per_user_limit');
+  });
 });

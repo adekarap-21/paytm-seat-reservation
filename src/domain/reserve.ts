@@ -16,9 +16,33 @@ export async function reserve(input: ReserveInput): Promise<ReserveSuccess> {
   const sorted = [...input.seats].sort();   // defensive — route already sorts
 
   return withTx(async (conn) => {
-    const [shows] = await conn.query<any[]>('SELECT id, price_paise FROM shows WHERE id=?', [input.show_id]);
+    const [shows] = await conn.query<any[]>('SELECT id, price_paise, per_user_limit FROM shows WHERE id=?', [input.show_id]);
     if (shows.length === 0) throw new NotFoundError('show not found');
     const price = shows[0].price_paise as number;
+    const perUserLimit = shows[0].per_user_limit as number;
+
+    // Serialize same-user transactions: lock the user row to prevent concurrent limit over-run
+    // ponytail: global per-user lock; per-(user,show) lock if cross-show throughput matters
+    try {
+      await conn.query('SELECT id FROM users WHERE id=? FOR UPDATE', [input.user_id]);
+    } catch (e: any) {
+      if (e?.code === 'ER_LOCK_WAIT_TIMEOUT' || e?.code === 'ER_LOCK_DEADLOCK') {
+        throw new ConflictError('per_user_limit', 'per-user seat limit contention');
+      }
+      throw e;
+    }
+
+    // Per-user limit: count user's current confirmed seats for this show (FOR UPDATE = current read)
+    const [cur] = await conn.query<any[]>(
+      `SELECT COUNT(*) AS c FROM reservation_seats rs
+       JOIN reservations r ON rs.reservation_id = r.id
+       WHERE r.show_id=? AND r.user_id=? AND r.status='confirmed' AND rs.cancelled_at IS NULL
+       FOR UPDATE`,
+      [input.show_id, input.user_id],
+    );
+    if ((cur[0].c as number) + sorted.length > perUserLimit) {
+      throw new ConflictError('per_user_limit', 'per-user seat limit exceeded');
+    }
 
     const reservation_id = ulid();
     for (const seat of sorted) {
@@ -30,8 +54,8 @@ export async function reserve(input: ReserveInput): Promise<ReserveSuccess> {
           [input.user_id, reservation_id, input.show_id, seat],
         );
       } catch (e: any) {
-        if (e?.code === 'ER_LOCK_WAIT_TIMEOUT') {
-          throw new ConflictError('seat_taken', 'seat lock wait timeout');
+        if (e?.code === 'ER_LOCK_WAIT_TIMEOUT' || e?.code === 'ER_LOCK_DEADLOCK') {
+          throw new ConflictError('seat_taken', 'seat lock contention');
         }
         throw e;
       }
