@@ -24,5 +24,7 @@ export function createApp(): Express {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  const { loadUsers } = await import('./auth.js');
+  await loadUsers();
   createApp().listen(config.port, () => logger.info({ port: config.port }, 'listening'));
 }
