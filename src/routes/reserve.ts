@@ -17,17 +17,18 @@ export const reserveRouter = Router();
 
 reserveRouter.post('/shows/:id/reserve', requireUser, async (req, res, next) => {
   const t0 = process.hrtime.bigint();
+  const showId = req.params.id as string;
   try {
     const normalized = normalize(req.body);
     const hash = hashBody(normalized);
     const result = await reserve({
-      show_id: req.params.id, user_id: req.userId!,
+      show_id: showId, user_id: req.userId!,
       seats: normalized.seats, idem_key: normalized.idempotency_key, body_hash: hash,
     });
-    reservationsCounter.inc({ outcome: result.kind === 'replay' ? 'idempotent_replay' : 'confirmed', show_id: req.params.id });
+    reservationsCounter.inc({ outcome: result.kind === 'replay' ? 'idempotent_replay' : 'confirmed', show_id: showId });
     const elapsed = Number(process.hrtime.bigint() - t0) / 1e9;
-    reserveLatencyHistogram.observe({ show_id: req.params.id }, elapsed);
-    await refreshSeatGauges(req.params.id);
+    reserveLatencyHistogram.observe({ show_id: showId }, elapsed);
+    await refreshSeatGauges(showId);
     if (result.kind === 'created') {
       const now = result.created_at.toISOString();
       for (const seat of result.seats) {
@@ -46,10 +47,10 @@ reserveRouter.post('/shows/:id/reserve', requireUser, async (req, res, next) => 
     });
   } catch (e: any) {
     if (e instanceof z.ZodError) {
-      reservationsCounter.inc({ outcome: 'validation_error', show_id: req.params.id });
+      reservationsCounter.inc({ outcome: 'validation_error', show_id: showId });
       return next(new ValidationError(e.issues.map((i: any) => i.message).join('; ')));
     }
-    if (e?.code && e?.status === 409) reservationsCounter.inc({ outcome: e.code, show_id: req.params.id });
+    if (e?.code && e?.status === 409) reservationsCounter.inc({ outcome: e.code, show_id: showId });
     next(e);
   }
 });

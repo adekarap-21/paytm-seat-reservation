@@ -9,7 +9,7 @@ export const cancelRouter = Router();
 
 cancelRouter.post('/reservations/:id/cancel', requireUser, async (req, res, next) => {
   try {
-    const out = await cancelReservation(req.params.id, req.userId!);
+    const out = await cancelReservation(req.params.id as string, req.userId!);
     cancellationsCounter.inc({ show_id: out.show_id });
     // Refresh gauges outside tx (pool, after cancelReservation returns)
     const [rows] = await pool.query<any[]>(

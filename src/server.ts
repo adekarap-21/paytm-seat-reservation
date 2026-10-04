@@ -16,7 +16,7 @@ export function createApp(): Express {
   const app = express();
   app.disable('x-powered-by');
   app.use(requestId);
-  app.use(pinoHttp({ logger, genReqId: (req) => (req as any).id }));
+  app.use((pinoHttp as any)({ logger, genReqId: (req: any) => req.id }));
   app.use(httpMetrics);
   app.use(express.json({ limit: '32kb' }));
   app.use(opsRouter);
