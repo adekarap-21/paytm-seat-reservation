@@ -6,3 +6,6 @@ dist
 *.log
 .vitest-cache
 *.pdf
+
+.DS_Store
+.claude/
