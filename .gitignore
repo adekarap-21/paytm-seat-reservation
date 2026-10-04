@@ -1,6 +1,8 @@
 node_modules
 dist
+.data
 .env
 .fly-burst-env
 *.log
 .vitest-cache
+*.pdf

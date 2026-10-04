@@ -1,0 +1,28 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: seatres
+      MYSQL_USER: app
+      MYSQL_PASSWORD: devpass
+    command: ["mysqld", "--innodb-lock-wait-timeout=2", "--innodb-buffer-pool-size=128M"]
+    ports: ["3307:3306"]
+    volumes: ["./.data/mysql:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment:
+      DATABASE_URL: mysql://app:devpass@mysql:3306/seatres
+      PORT: 8080
+      NODE_ENV: development
+      TOKEN_SECRET: dev-secret
+      ADMIN_TOKEN: dev-admin
+    ports: ["8080:8080"]
