@@ -6,6 +6,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 import { logger } from './logger.js';
 import { registry } from './metrics.js';
 import { config } from './config.js';
+import { showsRouter } from './routes/shows.js';
 
 export function createApp(): Express {
   const app = express();
@@ -19,6 +20,7 @@ export function createApp(): Express {
     res.set('Content-Type', registry.contentType);
     res.end(await registry.metrics());
   });
+  app.use(showsRouter);
   app.use(errorHandler);
   return app;
 }
